@@ -459,12 +459,12 @@ keylog_close (void *handle)
 }
 
 
-static const struct lsquic_keylog_if keylog_if =
+/*static const struct lsquic_keylog_if keylog_if =
 {
     .kli_open       = keylog_open,
     .kli_log_line   = keylog_log_line,
     .kli_close      = keylog_close,
-};
+};*/
 
 
 int
@@ -678,11 +678,11 @@ main (int argc, char **argv)
     eapi.ea_packets_out_ctx = &h3cli;
     eapi.ea_stream_if       = &h3cli_client_callbacks;
     eapi.ea_stream_if_ctx   = &h3cli;
-    if (key_log_dir)
+    /*if (key_log_dir)
     {
         eapi.ea_keylog_if = &keylog_if;
         eapi.ea_keylog_ctx = (void *) key_log_dir;
-    }
+    }*/
     eapi.ea_settings = &settings;
 
     h3cli.h3cli_engine = lsquic_engine_new(LSENG_HTTP, &eapi);

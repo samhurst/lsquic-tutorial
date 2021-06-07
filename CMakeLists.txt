@@ -16,6 +16,8 @@ MESSAGE(STATUS "Compiler flags: ${CMAKE_C_FLAGS}")
 
 ADD_SUBDIRECTORY(boringssl)
 
+INCLUDE(GNUInstallDirs)
+
 INCLUDE_DIRECTORIES(boringssl/include)
 INCLUDE_DIRECTORIES(lsquic/include)
 INCLUDE_DIRECTORIES(lsquic/src/liblsquic)       # For lsquic_xxhash.h

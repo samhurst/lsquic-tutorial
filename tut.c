@@ -43,6 +43,7 @@ struct tut
     struct ev_loop             *tut_loop;
     lsquic_engine_t            *tut_engine;
     struct sockaddr_storage     tut_local_sas;
+    int                         tut_datagram;
     union
     {
         struct client
@@ -53,6 +54,11 @@ struct tut
             char                buf[0x100]; /* Read up to this many bytes */
         }   c;
     }                   tut_u;
+    struct {
+        size_t          sz;
+        off_t           off;
+        unsigned char   buf[0x100];
+    } tut_s_dgbuf;
 };
 
 static void tut_process_conns (struct tut *);
@@ -459,6 +465,13 @@ tut_client_on_read_v0 (struct lsquic_stream *stream, lsquic_stream_ctx_t *h)
     }
 }
 
+/* For DATAGRAMs */
+static void
+tut_client_on_datagram (lsquic_conn_t *c, const void *buf, size_t sz)
+{
+    fwrite (buf, 1, sz, stdout);
+    fflush (stdout);
+}
 
 static size_t
 tut_client_readf_v1 (void *ctx, const unsigned char *data, size_t len, int fin)
@@ -581,6 +594,28 @@ tut_client_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_t *h)
     }
 }
 
+/* For DATAGRAMs */
+static ssize_t
+tut_client_on_dg_write (lsquic_conn_t *ctx, void *buf, size_t buf_sz)
+{
+    struct tut *tut = (struct tut *) lsquic_conn_get_ctx(ctx);
+    size_t to_write = tut->tut_u.c.sz;
+
+    if (to_write > buf_sz) to_write = buf_sz;
+
+    memcpy (buf, tut->tut_u.c.buf, to_write);
+
+    tut->tut_u.c.sz -= to_write;
+    if (to_write < tut->tut_u.c.sz) {
+        LOG("wrote %zd bytes to datagram, still have %zd bytes to write",
+                to_write, tut->tut_u.c.sz);
+        memmove (tut->tut_u.c.buf, tut->tut_u.c.buf + to_write, tut->tut_u.c.sz);
+    } else {
+        LOG("wrote %zd bytes to datagram, writing complete", to_write);
+    }
+
+    return (ssize_t) to_write;
+}
 
 static void
 tut_client_on_close (struct lsquic_stream *stream, lsquic_stream_ctx_t *h)
@@ -607,6 +642,8 @@ static struct lsquic_stream_if tut_client_callbacks =
     .on_read            = tut_client_on_read_v0,
     .on_write           = tut_client_on_write,
     .on_close           = tut_client_on_close,
+    .on_dg_write        = tut_client_on_dg_write,
+    .on_datagram        = tut_client_on_datagram
 };
 
 
@@ -714,6 +751,22 @@ tut_server_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *h)
     }
 }
 
+static void
+tut_server_on_datagram (lsquic_conn_t *ctx, const void *buf, size_t sz)
+{
+    struct tut *tut = (struct tut *) lsquic_conn_get_ctx(ctx);
+
+    if (sz > tut->tut_s_dgbuf.sz - tut->tut_s_dgbuf.off) {
+        LOG("received too many bytes for buffer: %zd > %zd", sz,
+                tut->tut_s_dgbuf.sz - tut->tut_s_dgbuf.off);
+        sz = tut->tut_s_dgbuf.sz - tut->tut_s_dgbuf.off - 1;
+        if (sz == 0) return;
+    }
+    memcpy (tut->tut_s_dgbuf.buf + tut->tut_s_dgbuf.off, buf, sz);
+    tut->tut_s_dgbuf.off += sz;
+    lsquic_conn_want_datagram_write (ctx, 1);
+    LOG("read %zd bytes of datagram\n", sz);
+}
 
 static void
 tut_server_on_write_v0 (struct lsquic_stream *stream, lsquic_stream_ctx_t *h)
@@ -769,6 +822,28 @@ tssc_size (void *ctx)
     return tssc->tssc_sz - tssc->tssc_off;
 }
 
+/* For DATAGRAMs */
+static ssize_t
+tut_server_on_dg_write (lsquic_conn_t *ctx, void *buf, size_t buf_sz)
+{
+    struct tut *tut = (struct tut *) lsquic_conn_get_ctx(ctx);
+    size_t to_write = tut->tut_s_dgbuf.off;
+
+    if (to_write > buf_sz) to_write = buf_sz;
+
+    memcpy (buf, tut->tut_s_dgbuf.buf, to_write);
+
+    tut->tut_s_dgbuf.off -= to_write;
+    if (to_write < tut->tut_s_dgbuf.off) {
+        LOG("wrote %zd bytes to datagram, still have %zd bytes to write",
+                to_write, tut->tut_u.c.sz);
+        memmove (tut->tut_s_dgbuf.buf, buf, to_write);
+    } else {
+        LOG("wrote %zd bytes to datagram, writing complete", to_write);
+    }
+
+    return (ssize_t) to_write;
+}
 
 /* Same functionality as tut_server_on_write_v0(), but use the "reader"
  * callbacks.  This is most useful when data comes from a different source
@@ -821,6 +896,8 @@ static struct lsquic_stream_if tut_server_callbacks =
     .on_read            = tut_server_on_read,
     .on_write           = tut_server_on_write_v0,
     .on_close           = tut_server_on_close,
+    .on_dg_write        = tut_server_on_dg_write,
+    .on_datagram        = tut_server_on_datagram
 };
 
 
@@ -841,8 +918,13 @@ tut_read_stdin (EV_P_ ev_io *w, int revents)
                             || sizeof(tut->tut_u.c.buf) == tut->tut_u.c.sz)
         {
             LOG("read up to newline (or filled buffer): make new stream");
-            lsquic_conn_make_stream(tut->tut_u.c.conn);
-            ev_io_stop(tut->tut_loop, w);
+            if (tut->tut_datagram == 1) {
+                int rv = lsquic_conn_want_datagram_write (tut->tut_u.c.conn, 1);
+                LOG("lsquic_conn_want_datagram_write returned %d", rv);
+            } else {
+                lsquic_conn_make_stream(tut->tut_u.c.conn);
+                ev_io_stop(tut->tut_loop, w);
+            }
             tut_process_conns(tut);
         }
     }
@@ -1101,13 +1183,15 @@ keylog_close (void *handle)
     fclose(handle);
 }
 
-
-static const struct lsquic_keylog_if keylog_if =
+/* This interface seems to have changed in more modern lsquic, but commenting
+ * it out works and lets everything compile for now, will fix later if needed
+ */
+/*static const struct lsquic_keylog_if keylog_if =
 {
     .kli_open       = keylog_open,
     .kli_log_line   = keylog_log_line,
     .kli_close      = keylog_close,
-};
+};*/
 
 
 int
@@ -1116,7 +1200,7 @@ main (int argc, char **argv)
     struct lsquic_engine_api eapi;
     const char *cert_file = NULL, *key_file = NULL, *val;
     int opt, is_server, version_cleared = 0, settings_initialized = 0;
-    int packets_out_version = 0;
+    int packets_out_version = 0, use_datagrams = 0;
     socklen_t socklen;
     struct lsquic_engine_settings settings;
     struct tut tut;
@@ -1237,6 +1321,19 @@ main (int argc, char **argv)
             else if (0 == strncmp(optarg, "ecn=", val - optarg))
                 settings.es_ecn = atoi(val);
             /* ...and so on: add more options here as necessary */
+            else if (0 == strncmp(optarg, "datagrams=", val - optarg)) {
+                if (0 == strncmp(val, "true", strlen(val))) {
+                    settings.es_datagrams = 1;
+                    tut.tut_datagram = 1;
+                } else if (0 == strncmp(val, "false", strlen(val))) {
+                    settings.es_datagrams = 0;
+                    tut.tut_datagram = 0;
+                } else {
+                    fprintf(stderr, "error: Datagrams option must be either "
+                            "true or false, not %s\n", val);
+                    exit (EXIT_FAILURE);
+                }
+            }
             else
             {
                 fprintf(stderr, "error: unknown option `%.*s'\n",
@@ -1371,11 +1468,11 @@ main (int argc, char **argv)
                             ? &tut_server_callbacks : &tut_client_callbacks;
     eapi.ea_stream_if_ctx = &tut;
     eapi.ea_get_ssl_ctx   = tut_get_ssl_ctx;
-    if (key_log_dir)
+    /*if (key_log_dir)
     {
         eapi.ea_keylog_if = &keylog_if;
         eapi.ea_keylog_ctx = (void *) key_log_dir;
-    }
+    }*/
     eapi.ea_settings = &settings;
 
     tut.tut_engine = lsquic_engine_new(tut.tut_flags & TUT_SERVER
